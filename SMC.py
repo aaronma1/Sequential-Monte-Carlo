@@ -93,12 +93,12 @@ class ModulatedTarget(torch.nn.Module):
     def __init__(self, model: AutoModelForCausalLM, phi: AutoModelForSequenceClassification, tk: Tokenizer):
         nn.Module.__init__(self)
         self.model = model
-        self.phi = phi
+        self._phi = phi
         self.tk = tk
 
     # returns a probability distribution [p, 1-p] where p is the probability that
     # text is non-toxic
-    def forward(self, particles: torch.Tensor, prefix: int, particle_logprobs=None) -> torch.Tensor:
+    def forward(self, particles: torch.Tensor, last_hidden_state: torch.Tensor, prefix: int, particle_logprobs=None) -> torch.Tensor:
         """
         gives sigma(s_1 ... s_T) = p(c = 1 | s_{1:T})p(s_{1:t})
 
@@ -106,28 +106,28 @@ class ModulatedTarget(torch.nn.Module):
         attention_mask: torch.Tensor of shape (batch_size, l)
         tokens_logprob: torch.Tensor of shape (batch_size)
         """
-
         x, attention_mask = self.tk.q_to_sigma(particles)
-        phi_logits = self.phi(x, attention_mask=attention_mask).logits.squeeze()
-        phi_logprob = F.logsigmoid(phi_logits)
-
+        sigma_logits = self._phi(x).logits.squeeze()
+        sigma_logprob = F.logsigmoid(sigma_logits)
         # if we have logp particles, we can return immediately
         if particle_logprobs is not None:
-            return phi_logprob + particle_logprobs
-
+            return sigma_logprob + particle_logprobs
         # gather logits for particles
         attention_mask = torch.ones_like(particles, device=particles.device, dtype=torch.int)
         logits = self.model(particles, attention_mask=attention_mask).logits
         # compute log q(s_1:t)
         logprob = torch.gather(logits[prefix:], 2, particles[prefix:].unsqueeze(2)).sum(axis=1)
-        return phi_logprob + logprob
+        return sigma_logprob + logprob
 
+    def phi(self, particles: torch.Tensor) -> torch.Tensor:
+        x, attention_mask = self.tk.q_to_sigma(particles)
+        sigma_logits = self._phi(x).logits.squeeze()
+        return F.logsigmoid(sigma_logits)
 
 
 class TwistHead(nn.Module):
-    def __init__(self, target, input_dim=1024, device="cpu", h=512):
+    def __init__(self, phi, tk: Tokenizer, input_dim=1024, device="cpu", h=512):
         self.device = device
-
         self.mlp = nn.Parameter(
             nn.Sequential(
                 nn.Linear(input_dim, h),
@@ -138,35 +138,96 @@ class TwistHead(nn.Module):
                 nn.Relu(),
                 nn.Linear(h, 1)
             )
-        )
+        ).to(device)
 
-    def forward(self, last_hidden_state: torch.Tensor, t) -> torch.Tensor:
+    # return log psi (s_{1:t})
+    def forward(self, particles: torch.Tensor, last_hidden_state: torch.Tensor, prefix: int, particle_logprobs=None) -> torch.Tensor:
         # perform mean pooling on last hidden
+        t = particles.shape[0] - prefix
         if t == 0:
-            return 1
+            return torch.tensor(0.0)
+        if t == self.T:
+            return self.phi.phi(particles)
+
         mp = last_hidden_state.mean(dim=1)
         return self.mlp(mp)
 
 
+def sample_t(q: Proposal, prefixes: torch.Tensor, T: int, batch_size=0):
+    """
+    Samples sequences si_{1:T} from q with the ith sequence having si_0 = prefix[i]
+
+    q: Proposal distribution
+    prefixes: torch.Tensor of shape (batch_size, prefix_length)
+    T: sequence length of each samples
+    """
+
+    if batch_size == 0:
+        batch_size = prefixes.shape[0]
+
+    dev = prefixes.device
+    K = prefixes.shape[0]
+    k_batches = K // batch_size
+
+    prefix_length = prefixes.shape[1]
+    particles = torch.cat((prefixes, torch.zeros(K, T + 1, device=dev, dtype=torch.int)), dim=-1)
+    logprob_q = torch.zeros(K, T + prefix_length + 1, device=dev)  # store log q(s_t | s_{0:t-1})
+    hidden_states = torch.zeros(K, T + prefix_length + 1, device=dev)
+    for t in range(T + 1):
+        for i in range(k_batches):
+            # get batch
+            b_start = batch_size * i
+            b_end = torch.max(K, b_start + batch_size)
+            batch = particles[b_start: b_end, :t + prefix_length]
+            attention_mask = torch.ones_like(batch, device=dev, dtype=torch.int)
+
+            # predict next tokens
+            next_logits, hidden = q.logits(batch.int(), attention_mask)
+            particles[b_start:b_end, t + prefix_length] = torch.multinomial(
+                torch.softmax(next_logits, dim=1), num_samples=1).squeeze()
+
+            # compute and store next token log probabilities
+            logprobs = F.log_softmax(next_logits, dim=1)
+            logprob_q[b_start:b_end, t + prefix_length] = torch.gather(
+                logprobs, 1, particles[b_start:b_end, t + prefix_length].unsqueeze(1)).squeeze()
+
+            if t == T+1:
+                hidden_states[b_start: b_end] = hidden[0]
+
+    return particles, hidden_states, logprob_q
+
+
+# should return E log 
+def ctl_loss(particles: torch.Tensor, last_hidden_state: torch.Tensor, twists: TwistHead, prefix_len: int):
+    t = particles.shape[1] - prefix_len
+
+    next_particles,  = sample_t()
+
+
+
+
+
+def train_twists(p: Proposal, sigma: ModulatedTarget, twists: TwistHead):
+    pass
+
+
 # SMC to sample sentences from q
 # in this case p0 = base model
-def smc(q: Proposal, tk: Tokenizer, s0="", K_batches=10, T=20, batch_size=10):
+def smc(q: Proposal, tk: Tokenizer, s0="", k_batches=10, T=20, batch_size=10):
     dev = tk.device
-    K = K_batches * batch_size
+    K = k_batches * batch_size
     prefixes, prefixes_attention_mask = tk.tok_q([s0 for i in range(K)])
     prefix_length = max(prefixes.shape[1], 1)
 
     particles = torch.cat((prefixes, torch.zeros(K, T + 1, device=dev, dtype=torch.int)), dim=-1)
     logprob_q = torch.zeros(K, T + prefix_length + 1, device=dev)  # store log q(s_t | s_{0:t-1})
-    # logprob_p0 = torch.zeros(K, T + prefix_length + 1, device=dev)  # store log p0(s_t | s_{0:t-1})
-    log_twists = torch.ones(K, T + prefix_length + 1, device=dev)
 
     for t in range(T + 1):
-        for i in range(K_batches):
+        for i in range(k_batches):
             # get batch
             b_start = batch_size * i
             b_end = b_start + batch_size
-            batch = particles[b_start: b_end, :t + prefix_length] 
+            batch = particles[b_start: b_end, :t + prefix_length]
             attention_mask = torch.ones_like(batch, device=dev, dtype=torch.int)
 
             # predict next tokens
@@ -194,61 +255,44 @@ def smc(q: Proposal, tk: Tokenizer, s0="", K_batches=10, T=20, batch_size=10):
         print(s, torch.sum(logprob_q[i]))
 
 
-def sis(q: Proposal, sigma, tk: Tokenizer, s0="", K_batches=10, T=20, batch_size=10):
+def sis_from_s0(q: Proposal, sigma, tk: Tokenizer, s0: str, k_batches=10, T=20, batch_size=10):
+    K = k_batches * batch_size
+    particles, _ = tk.tok_q([s0 for _ in range(K)])
+    return sis(q, sigma, tk, particles, k_batches=k_batches, T=T, batch_size=batch_size)
 
-    dev = tk.device
-    K = K_batches * batch_size
-    prefixes, prefixes_attention_mask = tk.tok_q([s0 for i in range(K)])
-    prefix_length = max(prefixes.shape[1], 1)
 
-    particles = torch.cat((prefixes, torch.zeros(K, T + 1, device=dev, dtype=torch.int)), dim=-1)
-    logprob_q = torch.zeros(K, T + prefix_length + 1, device=dev)  # store log q(s_t | s_{0:t-1})
-    # logprob_p0 = torch.zeros(K, T + prefix_length + 1, device=dev)  # store log p0(s_t | s_{0:t-1})
+def sis(q: Proposal, sigma, tk: Tokenizer, prefix: torch.Tensor, k_batches=10, T=20, batch_size=10, log_target=True):
+    """
+        perform simple importance sampling to estimate E log sigma(s_{t+1:T} | s_{0:t})
+    """
+    K = k_batches * batch_size
+    prefix_length = prefix.shape[1]
+    dev = prefix.device
 
-    for t in range(T + 1):
-        for i in range(K_batches):
-            # get batch
-            b_start = batch_size * i
-            b_end = b_start + batch_size
-            batch = particles[b_start: b_end, :t + prefix_length] 
-            attention_mask = torch.ones_like(batch, device=dev, dtype=torch.int)
-
-            # predict next tokens
-            next_logits, hidden_states = q.logits(batch.int(), attention_mask)
-            particles[b_start:b_end, t + prefix_length] = torch.multinomial(
-                torch.softmax(next_logits, dim=1), num_samples=1).squeeze()
-
-            # compute and store next token log probabilities
-            logprobs = F.log_softmax(next_logits, dim=1)
-            logprob_q[b_start:b_end, t + prefix_length] = torch.gather(
-                logprobs, 1, particles[b_start:b_end, t + prefix_length].unsqueeze(1)).squeeze()
-        print(f"finished sampling {t}")
-
-    target_logprobs = torch.zeros(K, device=dev)
-
+    particles, hidden_states, logprob_q = sample_t(q, prefix, T, batch_size=batch_size)
     proposal_logprobs = torch.sum(logprob_q, axis=1)
+    # compute target log probs
+    target = torch.zeros(K, device=dev)
     # compute importance weights
-    for i in range(K_batches):
+    for i in range(k_batches):
         b_start = batch_size * i
         b_end = b_start + batch_size
         batch = particles[b_start:b_end]
-        sigma.forward(batch, prefix_length)
-        target_logprobs[b_start: b_end] = sigma.forward(batch, prefix_length, particle_logprobs=proposal_logprobs[b_start: b_end])
+        target[b_start: b_end] = sigma.forward(
+            batch, hidden_states, prefix_length, particle_logprobs=proposal_logprobs[b_start: b_end])
 
-    W = torch.exp(target_logprobs - proposal_logprobs)
+    if log_target:
+        W = torch.exp(target - proposal_logprobs)
+    else:
+        W = torch.exp(torch.log(target) - proposal_logprobs)
+
     Z_SIS = torch.sum(W) / K
 
-    for (i, s) in enumerate(tk.decode_gpt(particles)):
-        print(s, W[i], proposal_logprobs[i], target_logprobs[i])
-
-    print(Z_SIS)
-    return Z_SIS
+    return Z_SIS.item()
 
 
 
-
-
-
+import math
 if __name__ == "__main__":
     gpt_model, gpt_tokenizer = get_gpt2()
     toxicity_model, toxicity_tokenizer = get_toxicity_model()
@@ -258,12 +302,15 @@ if __name__ == "__main__":
     q = Proposal(gpt_model, temperature=1)
     # smc(q, tk, s0="I", K_batches=5, batch_size=25, T=30)
 
-    sis(q, sigma, tk, s0="I love", K_batches=2, T=5, batch_size=2)
 
 
+    Z_sis = torch.zeros(10)
+    for i in range(10):
+        Z_sis[i] = sis_from_s0(q, sigma, tk, s0="dirty dirty whore", k_batches=5, T=30, batch_size=50)
+        torch.cuda.memory._dump_snapshot(f"snapshot{i}.pickle")
+        torch.cuda.empty_cache()
+        print(Z_sis[i])
 
-    # train twists with CTL loss
-
-
+    print(Z_sis, torch.mean(Z_sis), torch.std(Z_sis))
 
 
